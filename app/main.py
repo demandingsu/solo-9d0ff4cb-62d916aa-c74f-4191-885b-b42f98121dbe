@@ -27,6 +27,18 @@ ST01,2026-03-01T01:00:00Z,49.1
 ST01,2026-03-01T02:00:00Z,47.5
 """
 
+REVISION_SET_CSV_EXAMPLE = """station,target_hour,revision,action,energy
+ST01,2026-03-01T00:00:00Z,1,set,50.5
+"""
+
+REVISION_WITHDRAW_CSV_EXAMPLE = """station,target_hour,revision,action,energy
+ST01,2026-03-01T01:00:00Z,1,withdraw,
+"""
+
+REVISION_RESTORE_CSV_EXAMPLE = """station,target_hour,revision,action,energy
+ST01,2026-03-01T01:00:00Z,2,set,49.4
+"""
+
 GENERATE_EXAMPLE = {
     "station": "ST01",
     "start_hour": "2026-03-01T00:00:00Z",
@@ -65,6 +77,25 @@ API_DESCRIPTION = """
 - 同键异值（批内或与本库已有数据冲突）：**整批拒收**（409），一行都不会写入。
 - 行格式错误：整批拒收（422），并逐行列出原因。
 
+## 实测修订（计量复核）
+
+普通导入的实测视为 **0 号修订**。`POST /imports/actual-revisions` 按 场站+目标小时+修订号 提交修订：
+
+- `action=set`：把该小时实测修订为新电量（`energy` 必填）；
+- `action=withdraw`：撤回该小时实测（`energy` 留空），该小时退出后续回测，
+  新生成的数据集中 `energy=null`、`missing_reason=no_actual`、`actual_revision` 为撤回修订号。
+
+规则：
+
+- 每小时只应用**更高**修订号；撤回后提交更高号 `set` 可**恢复**该小时实测。
+- 已处理修订**原样重投**：幂等跳过（`skipped_duplicates`），状态不变。
+- **旧号首次送达**（修订号 ≤ 该小时当前最大号且从未记录过）：整批拒收（409）。
+- **同号异内容**（批内或与库中记录冲突）：整批拒收（409）。
+- 普通实测导入（0 号）**不得覆盖已修订的小时，也不得复活已撤回记录**：冲突整批拒收（409）；
+  与已存 0 号记录同值的重投仍幂等跳过。
+- 数据集每行带回 `actual_revision`：0=普通导入实测，≥1=生效修订号，null=无实测。
+- 修订记录与当前生效实测在**同一个写事务**内生效；任一环节失败整体回滚，不留不一致状态。
+
 ## 数据集号语义
 
 - 同一数据集号 + 相同参数重试：直接读回首次保存的结果（`replayed=true`），即使期间又有新数据导入。
@@ -77,7 +108,7 @@ API_DESCRIPTION = """
 """
 
 TAGS = [
-    {"name": "imports", "description": "CSV 导入（整批原子，同键异值拒收）"},
+    {"name": "imports", "description": "CSV 导入（整批原子，同键异值拒收）；实测修订按修订号生效"},
     {"name": "datasets", "description": "回测样本数据集：生成、幂等重试、查询"},
     {"name": "meta", "description": "服务信息"},
 ]
@@ -178,6 +209,164 @@ def _import_batch(table: str, fields: list[str], key_fields: list[str], value_fi
         conn.close()
 
 
+def _latest_revision(conn, station: str, target_hour: str):
+    """该小时库中最高号修订记录（无则 None）。调用方须处于事务中。"""
+    return conn.execute(
+        "SELECT revision, action, energy FROM actual_revisions "
+        "WHERE station = ? AND target_hour = ? ORDER BY revision DESC LIMIT 1",
+        (station, target_hour),
+    ).fetchone()
+
+
+def _import_actuals(rows: list[dict]):
+    """普通实测导入 ≡ 投递 0 号修订。
+
+    - 已有 0 号记录：同值幂等跳过，异值整批 409；
+    - 该小时已存在修订（>=1 号）：普通导入不得覆盖已修订小时、不得复活已撤回记录，整批 409；
+    - 否则写入 0 号记录。
+    """
+    conn = db.connect(app.state.db_path)
+    inserted = skipped = 0
+    conflicts = []
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for row in rows:
+            key = (row["station"], row["target_hour"])
+            existing = conn.execute(
+                "SELECT energy FROM actuals WHERE station = ? AND target_hour = ?", key
+            ).fetchone()
+            if existing is not None:
+                if existing["energy"] != row["energy"]:
+                    conflicts.append({
+                        "key": {"station": key[0], "target_hour": key[1]},
+                        "reason": "same_key_different_value",
+                        "db_value": existing["energy"],
+                        "csv_value": row["energy"],
+                    })
+                else:
+                    skipped += 1
+                continue
+            latest = _latest_revision(conn, *key)
+            if latest is not None:
+                conflicts.append({
+                    "key": {"station": key[0], "target_hour": key[1]},
+                    "reason": "hour_already_revised",
+                    "message": "该小时已存在修订记录，普通实测导入（0 号）不得覆盖或复活，请改用 /imports/actual-revisions",
+                    "csv_value": row["energy"],
+                    "current_revision": latest["revision"],
+                    "effective_action": latest["action"],
+                    "effective_energy": latest["energy"],
+                })
+                continue
+            conn.execute(
+                "INSERT INTO actuals (station, target_hour, energy) VALUES (?, ?, ?)",
+                (row["station"], row["target_hour"], row["energy"]),
+            )
+            inserted += 1
+        if conflicts:
+            conn.execute("ROLLBACK")
+            raise HTTPException(status_code=409, detail={
+                "message": "实测导入与已有数据冲突，整批拒收（未写入任何行）",
+                "conflicts": conflicts,
+            })
+        _commit(conn)
+        return inserted, skipped
+    except HTTPException:
+        raise
+    except sqlite3.OperationalError as exc:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        _locked_to_503(exc)
+        raise
+    finally:
+        conn.close()
+
+
+def _import_actual_revisions(rows: list[dict]):
+    """实测修订导入：每小时只应用更高修订号。
+
+    - 修订号已记录：内容相同幂等跳过，内容不同整批 409（同号异内容）；
+    - 修订号未记录且不高于该小时当前最大号（含 0 号普通实测）：整批 409（旧号首次送达）；
+    - 同一批内同一小时的多个修订按修订号升序依次应用；
+    - 任何冲突整批回滚，一行都不写入。
+    """
+    conn = db.connect(app.state.db_path)
+    inserted = skipped = 0
+    conflicts = []
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        created_at = logic.canon(datetime.now(timezone.utc))
+        # 同一小时批内多个修订按修订号升序应用
+        ordered = sorted(rows, key=lambda r: (r["station"], r["target_hour"], r["revision"]))
+        batch_max: dict[tuple[str, str], int] = {}
+        for row in ordered:
+            hour_key = (row["station"], row["target_hour"])
+            existing = conn.execute(
+                "SELECT action, energy FROM actual_revisions "
+                "WHERE station = ? AND target_hour = ? AND revision = ?",
+                (hour_key[0], hour_key[1], row["revision"]),
+            ).fetchone()
+            if existing is not None:
+                if existing["action"] == row["action"] and existing["energy"] == row["energy"]:
+                    skipped += 1  # 已处理修订原样重投：幂等
+                else:
+                    conflicts.append({
+                        "key": {"station": hour_key[0], "target_hour": hour_key[1],
+                                "revision": row["revision"]},
+                        "reason": "same_revision_different_content",
+                        "message": "同号异内容",
+                        "db": {"action": existing["action"], "energy": existing["energy"]},
+                        "csv": {"action": row["action"], "energy": row["energy"]},
+                    })
+                continue
+            current_max = batch_max.get(hour_key, logic.BASE_REVISION - 1)
+            latest = _latest_revision(conn, *hour_key)
+            if latest is not None:
+                current_max = max(current_max, latest["revision"])
+            base_exists = conn.execute(
+                "SELECT 1 FROM actuals WHERE station = ? AND target_hour = ?", hour_key
+            ).fetchone()
+            if base_exists is not None:
+                current_max = max(current_max, logic.BASE_REVISION)
+            if row["revision"] <= current_max:
+                conflicts.append({
+                    "key": {"station": hour_key[0], "target_hour": hour_key[1],
+                            "revision": row["revision"]},
+                    "reason": "stale_revision",
+                    "message": "旧号首次送达：修订号不高于该小时当前最大修订号",
+                    "current_max_revision": current_max,
+                })
+                continue
+            conn.execute(
+                "INSERT INTO actual_revisions (station, target_hour, revision, action, energy, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (hour_key[0], hour_key[1], row["revision"], row["action"], row["energy"], created_at),
+            )
+            batch_max[hour_key] = row["revision"]
+            inserted += 1
+        if conflicts:
+            conn.execute("ROLLBACK")
+            raise HTTPException(status_code=409, detail={
+                "message": "修订冲突，整批拒收（未写入任何行）",
+                "conflicts": conflicts,
+            })
+        _commit(conn)
+        return inserted, skipped
+    except HTTPException:
+        raise
+    except sqlite3.OperationalError as exc:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        _locked_to_503(exc)
+        raise
+    finally:
+        conn.close()
+
+
 def _parse_or_reject(kind: str, parse_fn, csv_text: str):
     try:
         rows, errors, conflicts = parse_fn(csv_text)
@@ -208,6 +397,7 @@ def root():
         "endpoints": [
             "POST /imports/forecasts",
             "POST /imports/actuals",
+            "POST /imports/actual-revisions",
             "POST /datasets/{dataset_id}/generate",
             "GET /datasets",
             "GET /datasets/{dataset_id}",
@@ -259,7 +449,10 @@ def import_forecasts(
     "/imports/actuals",
     tags=["imports"],
     summary="导入实测 CSV",
-    description="整批原子导入。同键（场站+目标小时）同值幂等跳过；同键异值整批拒收（409）。",
+    description=(
+        "整批原子导入，视为 0 号修订。同键（场站+目标小时）同值幂等跳过；同键异值整批拒收（409）。"
+        "已存在修订（≥1 号）的小时：普通导入不得覆盖、不得复活已撤回记录，冲突整批拒收（409）。"
+    ),
 )
 def import_actuals(
     csv_text: str = Body(
@@ -274,13 +467,70 @@ def import_actuals(
     ),
 ):
     rows = _parse_or_reject("实测", logic.parse_actual_csv, csv_text)
-    inserted, skipped = _import_batch(
-        "actuals",
-        ["station", "target_hour", "energy"],
-        ["station", "target_hour"],
-        "energy",
-        rows,
-    )
+    inserted, skipped = _import_actuals(rows)
+    return {"inserted": inserted, "skipped_duplicates": skipped, "accepted_rows": len(rows)}
+
+
+@app.post(
+    "/imports/actual-revisions",
+    tags=["imports"],
+    summary="导入实测修订 CSV（计量复核）",
+    description=(
+        "按 场站+目标小时+修订号 提交修订：`action=set` 提交新电量（energy 必填），"
+        "`action=withdraw` 撤回该小时实测（energy 留空，退出后续回测）。"
+        "普通导入的实测为 0 号，修订号须 ≥1。每小时只应用更高修订号；"
+        "已处理修订原样重投幂等；旧号首次送达、同号异内容整批拒收（409）；"
+        "批内任何冲突整批回滚。"
+    ),
+    responses={
+        409: {"description": "同号异内容 / 旧号首次送达，整批拒收"},
+        422: {"description": "行格式错误（修订号非正整数、动作非法、set 缺电量、withdraw 带电量等）"},
+        503: {"description": "数据库被其他写入占用，可重试"},
+    },
+)
+def import_actual_revisions(
+    csv_text: str = Body(
+        media_type="text/csv",
+        openapi_examples={
+            "提交修订电量": {
+                "summary": "set：把 00 时实测修订为 50.5",
+                "description": (
+                    "计量复核发现 00 时实测 48.2 有误，以 1 号修订改为 50.5。"
+                    "之后生成的数据集该小时 energy=50.5、actual_revision=1；已生成的旧数据集保持原快照。"
+                ),
+                "value": REVISION_SET_CSV_EXAMPLE,
+            },
+            "撤回错误实测": {
+                "summary": "withdraw：撤回 01 时实测",
+                "description": (
+                    "复核确认 01 时实测不可用，提交 1 号 withdraw 撤回（energy 列留空）。"
+                    "该小时退出后续回测：新生成的数据集中 energy=null、missing_reason=no_actual、"
+                    "actual_revision=1。"
+                ),
+                "value": REVISION_WITHDRAW_CSV_EXAMPLE,
+            },
+            "更高修订恢复实测": {
+                "summary": "restore：撤回后以更高号 set 恢复",
+                "description": (
+                    "在 1 号 withdraw 之后提交 2 号 set：01 时实测恢复为 49.4，"
+                    "新数据集中 energy=49.4、actual_revision=2。每小时永远只生效最高号修订。"
+                ),
+                "value": REVISION_RESTORE_CSV_EXAMPLE,
+            },
+            "迟到重投（幂等）": {
+                "summary": "已处理修订原样重投 → 幂等跳过",
+                "description": (
+                    "把“提交修订电量”的 CSV 原样再发一遍：返回 200，计入 skipped_duplicates，状态不变。"
+                    "若同一修订号换上不同内容（同号异内容），或投递不高于当前最大号的修订"
+                    "（旧号首次送达），则整批 409 拒收，一行都不写入。"
+                ),
+                "value": REVISION_SET_CSV_EXAMPLE,
+            },
+        },
+    ),
+):
+    rows = _parse_or_reject("实测修订", logic.parse_actual_revision_csv, csv_text)
+    inserted, skipped = _import_actual_revisions(rows)
     return {"inserted": inserted, "skipped_duplicates": skipped, "accepted_rows": len(rows)}
 
 
@@ -380,11 +630,13 @@ def generate_dataset(
         )
         conn.executemany(
             "INSERT INTO dataset_rows (dataset_id, station, target_hour, cutoff_issued_at, "
-            "issued_at, irradiance, energy, missing_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "issued_at, irradiance, energy, actual_revision, missing_reason) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 (
                     dataset_id, r["station"], r["target_hour"], r["cutoff_issued_at"],
-                    r["issued_at"], r["irradiance"], r["energy"], r["missing_reason"],
+                    r["issued_at"], r["irradiance"], r["energy"], r["actual_revision"],
+                    r["missing_reason"],
                 )
                 for r in rows
             ],

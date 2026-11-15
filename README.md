@@ -2,14 +2,14 @@
 
 把历史辐照预报与实测发电量配成回测样本的 API 服务（FastAPI + SQLite）。
 核心保证：**事后发布（迟到）的预报不会进入样本**；生成结果来自同一个已提交快照；
-同数据集号重试幂等；导入同键异值整批拒收。
+同数据集号重试幂等；导入同键异值整批拒收；**实测修订按修订号生效，被撤回的错误实测退出后续回测**。
 
 ## 快速开始
 
 ```bash
 docker compose up --build -d
 curl http://localhost:8000/health
-# 交互式文档（含迟到预报、重试、冲突示例，可直接在页面里执行）
+# 交互式文档（含迟到预报、修订撤回/恢复/迟到重投、重试、冲突示例，可直接在页面里执行）
 open http://localhost:8000/docs
 ```
 
@@ -24,7 +24,7 @@ docker compose --profile multi up -d   # api:8000 与 api2:8001 共用 /data/app
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
-pytest                                  # 13 个端到端测试
+pytest                                  # 29 个端到端测试
 uvicorn app.main:app --reload           # 数据库默认写到 ./data/app.db
 ```
 
@@ -33,7 +33,8 @@ uvicorn app.main:app --reload           # 数据库默认写到 ./data/app.db
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | `/imports/forecasts` | 导入预报 CSV（`text/csv` 请求体） |
-| POST | `/imports/actuals` | 导入实测 CSV |
+| POST | `/imports/actuals` | 导入实测 CSV（视为 0 号修订） |
+| POST | `/imports/actual-revisions` | 导入实测修订 CSV（提交新电量 / 撤回） |
 | POST | `/datasets/{数据集号}/generate` | 生成回测样本并保存 |
 | GET | `/datasets/{数据集号}` | 读回已保存结果 |
 | GET | `/datasets` | 列出全部数据集 |
@@ -62,6 +63,29 @@ ST01,2026-03-01T00:00:00Z,48.2
 - **同键异值**（批内或与库中已有数据冲突）：**整批拒收**，返回 409 与冲突明细，一行都不写入。
 - 行格式错误：整批拒收，返回 422 与逐行错误。
 
+## 实测修订（计量复核）
+
+数据员收到计量复核单后，用修订接口让错误实测退出后续回测。普通导入的实测视为 **0 号修订**，
+修订 CSV 按 场站+目标小时+修订号（≥1）提交，`action` 为 `set`（提交新电量）或 `withdraw`（撤回）：
+
+```csv
+station,target_hour,revision,action,energy
+ST01,2026-03-01T00:00:00Z,1,set,50.5
+ST01,2026-03-01T01:00:00Z,1,withdraw,
+```
+
+- `set`：`energy` 必填；`withdraw`：`energy` 必须留空。动作也接受中文别名（`修正`/`撤回` 等）。
+- **每小时只应用更高修订号**：撤回后提交更高号 `set` 即可恢复该小时实测。
+- **已处理修订原样重投**：幂等跳过（`skipped_duplicates`），状态不变 —— 迟到重投安全。
+- **旧号首次送达**（修订号 ≤ 该小时当前最大号且从未记录过）：整批拒收（409，`stale_revision`）。
+- **同号异内容**（批内或与库中记录冲突）：整批拒收（409，`same_revision_different_content`）。
+- **批内任何冲突整批回滚**：一行都不会写入。
+- **普通实测导入（0 号）不得覆盖已修订的小时，也不得复活已撤回记录**：
+  冲突整批拒收（409，`hour_already_revised`）；与已存 0 号记录同值的重投仍幂等跳过，且不影响修订生效值。
+- 被撤回的小时退出后续回测：新生成的数据集中 `energy=null`、`missing_reason=no_actual`。
+- 数据集每行带回 `actual_revision`：`0`=普通导入实测，`≥1`=生效修订号，`null`=无实测。
+- 修订记录与当前生效实测在**同一个写事务**内生效；失败整体回滚，不留不一致状态。
+
 ## 配对规则与迟到预报
 
 生成参数：`station`、`start_hour`、`end_hour`（均含）、`lead_hours`（提前小时数）。
@@ -71,6 +95,7 @@ ST01,2026-03-01T00:00:00Z,48.2
 ```
 发布截止时刻 cutoff = target_hour - lead_hours
 采用 issued_at <= cutoff 的预报中最新的一条；issued_at > cutoff 的即迟到预报，不参与配对
+实测取当前生效值：普通导入（0 号）或被该小时最高号修订覆盖（set 换新电量 / withdraw 视为无实测）
 ```
 
 结果每行带回 `cutoff_issued_at` 与实际采用的 `issued_at`（来源时刻）。
@@ -131,17 +156,51 @@ curl -X POST http://localhost:8000/datasets/demo-20260301/generate \
 curl -X POST http://localhost:8000/datasets/demo-20260301/generate \
   -H 'Content-Type: application/json' \
   -d '{"station":"ST01","start_hour":"2026-03-01T00:00:00Z","end_hour":"2026-03-01T03:00:00Z","lead_hours":12}'
+
+# 6. 计量复核：1 号修订把 00 时实测改为 50.5
+curl -X POST http://localhost:8000/imports/actual-revisions \
+  -H 'Content-Type: text/csv' --data-binary @- <<'CSV'
+station,target_hour,revision,action,energy
+ST01,2026-03-01T00:00:00Z,1,set,50.5
+CSV
+
+# 7. 撤回 01 时实测（该小时退出后续回测：新数据集 no_actual）
+curl -X POST http://localhost:8000/imports/actual-revisions \
+  -H 'Content-Type: text/csv' --data-binary @- <<'CSV'
+station,target_hour,revision,action,energy
+ST01,2026-03-01T01:00:00Z,1,withdraw,
+CSV
+
+# 8. 更高修订恢复 01 时实测为 49.4
+curl -X POST http://localhost:8000/imports/actual-revisions \
+  -H 'Content-Type: text/csv' --data-binary @- <<'CSV'
+station,target_hour,revision,action,energy
+ST01,2026-03-01T01:00:00Z,2,set,49.4
+CSV
+
+# 9. 迟到重投第 6 步的修订：原样重投幂等（skipped_duplicates=1）；
+#    同号异内容或旧号首次送达则整批 409
+curl -X POST http://localhost:8000/imports/actual-revisions \
+  -H 'Content-Type: text/csv' --data-binary @- <<'CSV'
+station,target_hour,revision,action,energy
+ST01,2026-03-01T00:00:00Z,1,set,50.5
+CSV
+
+# 10. 新数据集按当前状态配对（00 时 50.5、01 时 49.4）；旧数据集仍是原快照
+curl -X POST http://localhost:8000/datasets/after-review/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"station":"ST01","start_hour":"2026-03-01T00:00:00Z","end_hour":"2026-03-01T03:00:00Z","lead_hours":24}'
 ```
 
 ## 项目结构
 
 ```
 app/
-  main.py    # FastAPI 路由、/docs 示例、事务边界
-  logic.py   # 时间规范化、CSV 解析、配对逻辑
-  db.py      # SQLite 连接（WAL、busy_timeout）与建表
+  main.py    # FastAPI 路由、/docs 示例、事务边界（导入/修订/生成）
+  logic.py   # 时间规范化、CSV 解析、修订解析、生效实测与配对逻辑
+  db.py      # SQLite 连接（WAL、busy_timeout）、建表与老库迁移
 tests/
-  test_api.py  # 13 个端到端测试（含快照隔离、失败回滚）
+  test_api.py  # 29 个端到端测试（含修订、快照隔离、失败回滚）
 Dockerfile
 docker-compose.yml
 ```

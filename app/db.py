@@ -26,9 +26,23 @@ CREATE INDEX IF NOT EXISTS idx_forecasts_lookup
 CREATE TABLE IF NOT EXISTS actuals (
     station     TEXT NOT NULL,
     target_hour TEXT NOT NULL,
-    energy      REAL NOT NULL,   -- 实测电量
+    energy      REAL NOT NULL,   -- 实测电量（视为 0 号修订）
     PRIMARY KEY (station, target_hour)
 );
+
+-- 实测修订：按 场站+目标小时+修订号 记录一次修订（提交新电量或撤回）。
+-- 每小时生效的是最高号修订；actuals 表中的普通导入视为 0 号。
+CREATE TABLE IF NOT EXISTS actual_revisions (
+    station      TEXT NOT NULL,
+    target_hour  TEXT NOT NULL,
+    revision     INTEGER NOT NULL CHECK (revision >= 1),
+    action       TEXT NOT NULL CHECK (action IN ('set', 'withdraw')),
+    energy       REAL,           -- action='set' 时的新电量；withdraw 时为 NULL
+    created_at   TEXT NOT NULL,  -- 修订记录写入的 UTC 时刻
+    PRIMARY KEY (station, target_hour, revision)
+);
+CREATE INDEX IF NOT EXISTS idx_actual_revisions_lookup
+    ON actual_revisions (station, target_hour, revision);
 
 CREATE TABLE IF NOT EXISTS datasets (
     dataset_id  TEXT PRIMARY KEY,
@@ -45,10 +59,18 @@ CREATE TABLE IF NOT EXISTS dataset_rows (
     issued_at        TEXT,           -- 实际采用的预报来源时刻（缺配为 NULL）
     irradiance       REAL,
     energy           REAL,
+    actual_revision  INTEGER,        -- 生效实测的修订号：0=普通导入，>=1=修订，NULL=无实测
     missing_reason   TEXT,           -- no_forecast / no_actual / no_forecast+no_actual / NULL
     PRIMARY KEY (dataset_id, target_hour)
 );
 """
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """老库就地升级：dataset_rows 补 actual_revision 列（actual_revisions 由建表语句兜底）。"""
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(dataset_rows)")}
+    if cols and "actual_revision" not in cols:
+        conn.execute("ALTER TABLE dataset_rows ADD COLUMN actual_revision INTEGER")
 
 
 def connect(db_path: str) -> sqlite3.Connection:
@@ -68,5 +90,6 @@ def init_db(db_path: str) -> None:
     conn = connect(db_path)
     try:
         conn.executescript(SCHEMA)
+        _migrate(conn)
     finally:
         conn.close()

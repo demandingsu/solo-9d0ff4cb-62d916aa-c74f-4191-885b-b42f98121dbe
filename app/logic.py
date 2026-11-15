@@ -1,4 +1,4 @@
-"""业务逻辑：时间规范化、CSV 解析、预报-实测配对。"""
+"""业务逻辑：时间规范化、CSV 解析、实测修订、预报-实测配对。"""
 from __future__ import annotations
 
 import csv
@@ -22,9 +22,16 @@ MISSING_BOTH = "no_forecast+no_actual"
 
 MISSING_REASON_CN = {
     MISSING_NO_FORECAST: "缺合格预报（截止发布时刻前无已发布预报，或已有预报全部迟到）",
-    MISSING_NO_ACTUAL: "缺实测电量",
+    MISSING_NO_ACTUAL: "缺实测电量（无实测，或实测已被修订撤回）",
     MISSING_BOTH: "合格预报与实测电量均缺",
 }
+
+# 实测修订动作：set=提交新电量；withdraw=撤回该小时实测（退出后续回测）。
+ACTION_SET = "set"
+ACTION_WITHDRAW = "withdraw"
+
+# 普通实测导入（/imports/actuals）视为 0 号修订；修订接口只接受 >= 1 的修订号。
+BASE_REVISION = 0
 
 
 class CsvFormatError(ValueError):
@@ -92,6 +99,28 @@ ACTUAL_COLUMNS = {
     "energy": _alias_set("energy", "actual_energy", "generation", "电量", "实测电量", "发电量"),
 }
 
+REVISION_COLUMNS = {
+    "station": _alias_set("station", "site", "plant", "场站", "电站", "场站编号"),
+    "target_hour": _alias_set("target_hour", "target", "target_time", "目标小时", "目标UTC小时", "目标时刻", "目标时间"),
+    "revision": _alias_set("revision", "rev", "version", "revision_no", "rev_no", "修订号", "版本号", "修订版本"),
+    "action": _alias_set("action", "op", "operation", "type", "操作", "动作", "类型"),
+    "energy": _alias_set("energy", "actual_energy", "generation", "电量", "实测电量", "发电量"),
+}
+
+ACTION_ALIASES = {
+    "set": ACTION_SET,
+    "revise": ACTION_SET,
+    "correct": ACTION_SET,
+    "设值": ACTION_SET,
+    "修正": ACTION_SET,
+    "修订": ACTION_SET,
+    "withdraw": ACTION_WITHDRAW,
+    "retract": ACTION_WITHDRAW,
+    "revoke": ACTION_WITHDRAW,
+    "撤回": ACTION_WITHDRAW,
+    "撤销": ACTION_WITHDRAW,
+}
+
 
 def _header_map(header, aliases, kind):
     mapping = {}
@@ -145,6 +174,47 @@ def _parse_actual_record(mapping, rec):
     return key, energy, {"station": station, "target_hour": target, "energy": energy}
 
 
+def _parse_revision_number(value: str) -> int:
+    s = (value or "").strip()
+    try:
+        n = int(s, 10)
+    except ValueError:
+        raise ValueError(f"修订号不是整数: {value!r}")
+    if n <= BASE_REVISION:
+        raise ValueError(f"修订号必须 >= {BASE_REVISION + 1}（{BASE_REVISION} 号保留给普通实测导入）: {value!r}")
+    return n
+
+
+def _parse_action(value: str) -> str:
+    s = (value or "").strip().lower()
+    action = ACTION_ALIASES.get(s)
+    if action is None:
+        raise ValueError(f"未知修订动作 {value!r}，仅支持 set（提交新电量）/ withdraw（撤回）")
+    return action
+
+
+def _parse_actual_revision_record(mapping, rec):
+    station = rec[mapping["station"]].strip()
+    if not station:
+        raise ValueError("场站为空")
+    target = canon(parse_hour(rec[mapping["target_hour"]]))
+    revision = _parse_revision_number(rec[mapping["revision"]])
+    action = _parse_action(rec[mapping["action"]])
+    energy_cell = rec[mapping["energy"]].strip()
+    if action == ACTION_SET:
+        energy = _parse_number(energy_cell, "电量")
+    else:
+        if energy_cell:
+            raise ValueError("撤回（withdraw）行的电量列必须为空")
+        energy = None
+    key = (station, target, revision)
+    value = (action, energy)
+    return key, value, {
+        "station": station, "target_hour": target, "revision": revision,
+        "action": action, "energy": energy,
+    }
+
+
 def _iter_records(text: str, aliases, kind: str, parse_record):
     """解析整份 CSV。
 
@@ -194,6 +264,10 @@ def parse_actual_csv(text: str):
     return _iter_records(text, ACTUAL_COLUMNS, "实测", _parse_actual_record)
 
 
+def parse_actual_revision_csv(text: str):
+    return _iter_records(text, REVISION_COLUMNS, "实测修订", _parse_actual_revision_record)
+
+
 # ---------------------------------------------------------------- 生成参数
 
 def normalize_generate_params(station: str, start_hour: str, end_hour: str, lead_hours: int):
@@ -221,8 +295,36 @@ def normalize_generate_params(station: str, start_hour: str, end_hour: str, lead
 
 # ---------------------------------------------------------------- 配对
 
+def fetch_effective_actuals(conn, station: str, start_s: str, end_s: str):
+    """当前生效实测：{target_hour: (energy 或 None, 生效修订号 或 None)}。
+
+    普通导入的实测是 0 号修订；actual_revisions 中每小时最高号修订覆盖之：
+    set → 新电量；withdraw → 该小时无实测（退出回测）。
+    调用方须处于事务中，保证与修订记录读到同一已提交快照。
+    """
+    effective: dict[str, tuple[Optional[float], Optional[int]]] = {}
+    for r in conn.execute(
+        "SELECT target_hour, energy FROM actuals "
+        "WHERE station = ? AND target_hour BETWEEN ? AND ?",
+        (station, start_s, end_s),
+    ):
+        effective[r["target_hour"]] = (r["energy"], BASE_REVISION)
+    # 按修订号升序扫过，每小时留下的即最高号修订
+    for r in conn.execute(
+        "SELECT target_hour, revision, action, energy FROM actual_revisions "
+        "WHERE station = ? AND target_hour BETWEEN ? AND ? "
+        "ORDER BY target_hour, revision",
+        (station, start_s, end_s),
+    ):
+        if r["action"] == ACTION_WITHDRAW:
+            effective[r["target_hour"]] = (None, r["revision"])
+        else:
+            effective[r["target_hour"]] = (r["energy"], r["revision"])
+    return effective
+
+
 def build_pairs(conn, station: str, start_dt: datetime, end_dt: datetime, lead_hours: int):
-    """逐目标小时配对：取发布时间不晚于 目标小时-lead_hours 的最新预报，配上实测。
+    """逐目标小时配对：取发布时间不晚于 目标小时-lead_hours 的最新预报，配上当前生效实测。
 
     调用方必须已处于写事务中（BEGIN IMMEDIATE），保证读到同一已提交快照。
     """
@@ -237,12 +339,7 @@ def build_pairs(conn, station: str, start_dt: datetime, end_dt: datetime, lead_h
     for r in forecast_rows:
         by_target.setdefault(r["target_hour"], []).append((r["issued_at"], r["irradiance"]))
 
-    actual_rows = conn.execute(
-        "SELECT target_hour, energy FROM actuals "
-        "WHERE station = ? AND target_hour BETWEEN ? AND ?",
-        (station, start_s, end_s),
-    ).fetchall()
-    actuals = {r["target_hour"]: r["energy"] for r in actual_rows}
+    actuals = fetch_effective_actuals(conn, station, start_s, end_s)
 
     lead = timedelta(hours=lead_hours)
     one_hour = timedelta(hours=1)
@@ -255,7 +352,7 @@ def build_pairs(conn, station: str, start_dt: datetime, end_dt: datetime, lead_h
         issued_list = [c[0] for c in candidates]
         idx = bisect_right(issued_list, cutoff_s) - 1  # 不晚于截止时刻的最新一条
         chosen = candidates[idx] if idx >= 0 else None
-        energy = actuals.get(target_s)
+        energy, actual_revision = actuals.get(target_s, (None, None))
 
         missing = None
         if chosen is None and energy is None:
@@ -272,6 +369,7 @@ def build_pairs(conn, station: str, start_dt: datetime, end_dt: datetime, lead_h
             "issued_at": chosen[0] if chosen else None,
             "irradiance": chosen[1] if chosen else None,
             "energy": energy,
+            "actual_revision": actual_revision,
             "missing_reason": missing,
             "missing_reason_cn": MISSING_REASON_CN.get(missing) if missing else None,
         })
